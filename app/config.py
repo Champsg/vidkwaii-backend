@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     keep_alive_enabled: bool = True
     keep_alive_interval_seconds: int = 600
-    render_external_url: Optional[str] = None
+    render_external_url: str | None = None
+
 
 
 @lru_cache
