@@ -372,6 +372,35 @@ def normalize(info: dict[str, Any], request: ExtractRequest) -> MediaInfo:
 
 def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
     target_url = request.url.strip()
+    clean_path = target_url.split("?")[0].lower()
+    
+    # 1. Instant handling for direct media URLs (MP4, M3U8, MP3, etc.)
+    direct_exts = (".mp4", ".m3u8", ".webm", ".mov", ".mp3", ".m4a", ".aac")
+    if any(clean_path.endswith(ext) for ext in direct_exts):
+        raw_name = target_url.split("?")[0].split("/")[-1] or "media_file"
+        ext = raw_name.split(".")[-1] if "." in raw_name else "mp4"
+        is_audio = ext in ("mp3", "m4a", "aac")
+        is_hls = ext == "m3u8" or "m3u8" in target_url.lower()
+        return {
+            "id": "direct",
+            "title": raw_name,
+            "url": target_url,
+            "extractor": "Direct Media",
+            "formats": [
+                {
+                    "format_id": "direct",
+                    "url": target_url,
+                    "ext": ext,
+                    "protocol": "https" if target_url.startswith("https") else "http",
+                    "resolution": "Direct Audio Stream" if is_audio else "Direct Video Stream",
+                    "has_video": not is_audio,
+                    "has_audio": True,
+                    "is_hls": is_hls,
+                }
+            ],
+        }
+
+    # 2. X.com -> twitter.com normalization for fast syndication extraction
     if "x.com" in target_url:
         target_url = target_url.replace("x.com", "twitter.com")
 
@@ -382,9 +411,9 @@ def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
         "noplaylist": True,
         "playlist_items": "1",
         "extract_flat": False,
-        "socket_timeout": 35,
+        "socket_timeout": 30,
         "retries": 3,
-        "nocheckcertificate": False,
+        "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "mweb", "web"],
@@ -396,8 +425,6 @@ def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
         },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
         }
     }
     try:
