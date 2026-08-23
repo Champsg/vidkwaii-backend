@@ -49,7 +49,10 @@ yt-dlp entirely and are resolved instantly. YouTube extraction uses the
 Produced files live in `MEDIA_DIR` and are garbage-collected after
 `MEDIA_TTL_SECONDS` (default 30 minutes).
 
+An automatic background keep-alive task runs every 10 minutes (`KEEP_ALIVE_INTERVAL_SECONDS=600`) to send pings to `RENDER_EXTERNAL_URL` (or localhost `/health`), preventing free Render web services from spinning down due to inactivity.
+
 ## Tests
+
 
 ```bash
 pip install -r requirements-dev.txt
