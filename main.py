@@ -584,29 +584,8 @@ def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
     if "x.com" in target_url:
         target_url = target_url.replace("x.com", "twitter.com")
 
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "playlist_items": "1",
-        "extract_flat": False,
-        "socket_timeout": 30,
-        "retries": 3,
-        "nocheckcertificate": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
-                "player_skip": ["js", "configs", "webpage"],
-            },
-            "twitter": {
-                "api": ["syndication"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        }
-    }
+    opts = _build_ydl_opts()
+    opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target_url, download=False)

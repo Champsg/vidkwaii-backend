@@ -69,8 +69,10 @@ FIXTURE = {
 class FakeYoutubeDL:
     def __init__(self, opts: dict) -> None:
         self.opts = opts
+        self.last_url: str | None = None
 
     def extract_info(self, url: str, download: bool = False) -> dict:
+        self.last_url = url
         assert download is False
         if "unsupported" in url:
             raise yt_dlp.utils.UnsupportedError(url)
@@ -146,6 +148,74 @@ def test_invalid_url_scheme_returns_422(client: TestClient) -> None:
     response = client.post("/api/v1/extract", json={"url": "ftp://example.com/file.mp4"})
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_URL"
+
+
+def test_direct_media_url_bypasses_extractor(client: TestClient, monkeypatch) -> None:
+    """Direct .mp4/.m3u8 URLs are resolved without scraping."""
+    called = {"value": False}
+
+    def fake_ydl(_opts):
+        called["value"] = True
+        raise AssertionError("yt-dlp must not be invoked for direct URLs")
+
+    monkeypatch.setattr(app_module.yt_dlp, "YoutubeDL", fake_ydl)
+    response = client.post(
+        "/api/v1/extract",
+        json={"url": "https://cdn.example.com/clip.mp4?token=abc"},
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["title"] == "clip.mp4"
+    assert data["is_direct"] is True
+    assert data["formats"][0]["url"].startswith("https://cdn.example.com/clip.mp4")
+    assert called["value"] is False
+
+
+def test_x_com_is_normalized_to_twitter(client: TestClient, monkeypatch) -> None:
+    instances: list[FakeYoutubeDL] = []
+
+    def factory(opts):
+        instance = FakeYoutubeDL(opts)
+        instances.append(instance)
+        return instance
+
+    # Re-patch so we can inspect the URL that yt-dlp actually receives.
+    monkeypatch.setattr(app_module.yt_dlp, "YoutubeDL", factory)
+    response = client.post(
+        "/api/v1/extract",
+        json={"url": "https://x.com/someuser/status/12345"},
+    )
+    assert response.status_code == 200
+    assert instances and instances[0].last_url == "https://twitter.com/someuser/status/12345"
+
+
+def test_merge_endpoint_returns_file_info(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_produce_media_file",
+        lambda url, kind, quality=None, audio_format="m4a": app_module.MediaFileInfo(
+            url="/api/v1/files/abc",
+            filename="merged.mp4",
+            size=12345,
+        ),
+    )
+    response = client.post(
+        "/api/v1/merge",
+        json={"url": "https://example.com/watch?v=abc123", "quality": "1080p"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["file"]["filename"] == "merged.mp4"
+    assert body["file"]["url"] == "/api/v1/files/abc"
+
+
+def test_audio_endpoint_rejects_bad_format(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/audio",
+        json={"url": "https://example.com/watch?v=abc123", "format": "wav"},
+    )
+    assert response.status_code == 422
 
 
 def test_health(client: TestClient) -> None:
