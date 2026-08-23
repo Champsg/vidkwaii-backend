@@ -12,11 +12,16 @@ import asyncio
 import hashlib
 import logging
 import re
+import shutil
+import time
+import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.cache import MediaCache
@@ -50,6 +55,12 @@ cache = MediaCache(
     redis_url=settings.redis_url,
     ttl_seconds=settings.cache_ttl_seconds,
 )
+
+MEDIA_DIR = Path(settings.media_dir)
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Registered produced files (merged videos / extracted audio): file_id -> meta
+_media_files: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------- schemas
@@ -140,6 +151,30 @@ class ExtractResponse(BaseModel):
     data: MediaInfo
 
 
+class MergeRequest(BaseModel):
+    url: str = Field(..., min_length=4, max_length=4096)
+    quality: Optional[str] = Field(
+        default=None,
+        description="best | 2160p | 1440p | 1080p | 720p | 480p | 360p",
+    )
+
+
+class AudioRequest(BaseModel):
+    url: str = Field(..., min_length=4, max_length=4096)
+    format: str = Field(default="m4a", pattern="^(mp3|m4a)$")
+
+
+class MediaFileInfo(BaseModel):
+    url: str
+    filename: str
+    size: Optional[int] = None
+
+
+class MergeResponse(BaseModel):
+    ok: bool = True
+    file: MediaFileInfo
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -165,6 +200,151 @@ class ExtractorFailure(Exception):
 
 
 # ---------------------------------------------------------------- helpers
+
+
+_QUALITY_SELECTORS = {
+    "best": "bestvideo+bestaudio/best",
+    "2160p": "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
+    "1440p": "bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
+    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+    "480p": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+}
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _validate_url(url: str) -> None:
+    lowered = url.strip().lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorDetail(
+                code="INVALID_URL",
+                message="Only http(s) URLs are supported.",
+                suggestion="Paste a full link starting with http:// or https://.",
+            ).model_dump(),
+        )
+
+
+def _normalize_target_url(url: str) -> str:
+    target = url.strip()
+    # x.com -> twitter.com for the fast syndication API extractor.
+    if "x.com" in target:
+        target = target.replace("x.com", "twitter.com")
+    return target
+
+
+def _build_ydl_opts() -> dict[str, Any]:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "playlist_items": "1",
+        "socket_timeout": 30,
+        "retries": 3,
+        "nocheckcertificate": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+                "player_skip": ["js", "configs", "webpage"],
+            },
+            "twitter": {"api": ["syndication"]},
+        },
+        "http_headers": _BROWSER_HEADERS,
+    }
+
+
+def _sweep_media_files() -> None:
+    """Delete produced files older than the TTL so the temp dir stays small."""
+    cutoff = time.monotonic() - settings.media_ttl_seconds
+    expired = [fid for fid, meta in _media_files.items() if meta["created"] < cutoff]
+    for fid in expired:
+        meta = _media_files.pop(fid, None)
+        if meta:
+            try:
+                Path(meta["path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _produce_media_file(
+    url: str,
+    kind: str,
+    quality: Optional[str] = None,
+    audio_format: str = "m4a",
+) -> MediaFileInfo:
+    """Download + (optionally) merge media on the server with yt-dlp + ffmpeg."""
+    _sweep_media_files()
+    target = _normalize_target_url(url)
+    work_id = uuid.uuid4().hex
+    opts = _build_ydl_opts()
+    opts["outtmpl"] = str(MEDIA_DIR / f"{work_id}.%(ext)s")
+    if kind == "merge":
+        selector = _QUALITY_SELECTORS.get(quality or "", _QUALITY_SELECTORS["best"])
+        opts.update(
+            {
+                "format": selector,
+                "merge_output_format": "mp4",
+            }
+        )
+    else:
+        opts.update(
+            {
+                "format": "bestaudio/best",
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": audio_format,
+                        "preferredquality": "192",
+                    }
+                ],
+            }
+        )
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=True)
+    except yt_dlp.utils.DownloadError as exc:
+        raise ExtractorFailure(
+            "MERGE_FAILED",
+            f"Could not download media: {exc}",
+            "The site may block datacenter IPs or the media may be unavailable.",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Server media production failed")
+        raise ExtractorFailure(
+            "MERGE_FAILED",
+            f"Unexpected error while producing media: {exc}",
+            None,
+        ) from exc
+
+    candidates = sorted(
+        MEDIA_DIR.glob(f"{work_id}.*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise ExtractorFailure(
+            "MERGE_FAILED",
+            "yt-dlp finished but produced no output file.",
+            "Try again or pick a different source.",
+        )
+    path = candidates[0]
+    file_id = uuid.uuid4().hex
+    filename = f"{_slugify(info.get('title') or path.stem)}{path.suffix}"
+    _media_files[file_id] = {"path": str(path), "created": time.monotonic()}
+    return MediaFileInfo(
+        url=f"/api/v1/files/{file_id}",
+        filename=filename,
+        size=path.stat().st_size,
+    )
 
 
 def _slugify(text: Optional[str], fallback: str = "media") -> str:
@@ -494,16 +674,7 @@ async def _extract(request: ExtractRequest) -> tuple[MediaInfo, bool]:
 
 
 async def _handle(request: ExtractRequest) -> ExtractResponse:
-    lowered = request.url.strip().lower()
-    if not (lowered.startswith("http://") or lowered.startswith("https://")):
-        raise HTTPException(
-            status_code=422,
-            detail=ErrorDetail(
-                code="INVALID_URL",
-                message="Only http(s) URLs are supported.",
-                suggestion="Paste a full link starting with http:// or https://.",
-            ).model_dump(),
-        )
+    _validate_url(request.url)
     try:
         info, cached = await _extract(request)
     except ExtractorFailure as exc:
@@ -534,6 +705,8 @@ async def health() -> dict[str, Any]:
         "service": settings.app_name,
         "version": app.version,
         "redis": redis_ok,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+        "media_files": len(_media_files),
     }
 
 
@@ -563,3 +736,95 @@ async def extract_get(
 )
 async def extract_post(request: ExtractRequest) -> ExtractResponse:
     return await _handle(request)
+
+
+@app.post(
+    "/api/v1/merge",
+    response_model=MergeResponse,
+    responses={422: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
+)
+async def merge_endpoint(request: MergeRequest) -> MergeResponse:
+    """Download video+audio streams and merge them server-side into one .mp4."""
+    _validate_url(request.url)
+    try:
+        file_info = await asyncio.wait_for(
+            asyncio.to_thread(
+                _produce_media_file,
+                request.url,
+                "merge",
+                quality=request.quality,
+            ),
+            timeout=settings.max_merge_seconds,
+        )
+    except ExtractorFailure as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorDetail(
+                code=exc.code,
+                message=exc.message,
+                suggestion=exc.suggestion,
+            ).model_dump(),
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=ErrorDetail(
+                code="MERGE_TIMEOUT",
+                message="Merging took too long and was cancelled.",
+                suggestion="Try a lower quality or a shorter video.",
+            ).model_dump(),
+        ) from exc
+    return MergeResponse(file=file_info)
+
+
+@app.post(
+    "/api/v1/audio",
+    response_model=MergeResponse,
+    responses={422: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
+)
+async def audio_endpoint(request: AudioRequest) -> MergeResponse:
+    """Download the best audio track and transcode it to .m4a or .mp3."""
+    _validate_url(request.url)
+    try:
+        file_info = await asyncio.wait_for(
+            asyncio.to_thread(
+                _produce_media_file,
+                request.url,
+                "audio",
+                audio_format=request.format,
+            ),
+            timeout=settings.max_merge_seconds,
+        )
+    except ExtractorFailure as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorDetail(
+                code=exc.code,
+                message=exc.message,
+                suggestion=exc.suggestion,
+            ).model_dump(),
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=ErrorDetail(
+                code="MERGE_TIMEOUT",
+                message="Audio extraction took too long and was cancelled.",
+                suggestion="Try again in a few minutes.",
+            ).model_dump(),
+        ) from exc
+    return MergeResponse(file=file_info)
+
+
+@app.get("/api/v1/files/{file_id}")
+async def serve_media_file(file_id: str) -> FileResponse:
+    """Stream a produced file. FileResponse supports HTTP Range requests, so
+    the mobile client can chunk-download it in parallel."""
+    meta = _media_files.get(file_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="File not found or expired.")
+    path = Path(meta["path"])
+    if not path.exists():
+        _media_files.pop(file_id, None)
+        raise HTTPException(status_code=404, detail="File not found or expired.")
+    return FileResponse(path, filename=path.name)
