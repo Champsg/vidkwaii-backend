@@ -1,4 +1,4 @@
-"""Media Hub — FastAPI extractor backend.
+﻿"""Media Hub — FastAPI extractor backend.
 
 Exposes ``/api/v1/extract`` which resolves a URL with yt-dlp and normalizes
 the raw extractor output into a clean, client-friendly payload: formats,
@@ -371,6 +371,10 @@ def normalize(info: dict[str, Any], request: ExtractRequest) -> MediaInfo:
 
 
 def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
+    target_url = request.url.strip()
+    if "x.com" in target_url:
+        target_url = target_url.replace("x.com", "twitter.com")
+
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -378,13 +382,27 @@ def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
         "noplaylist": True,
         "playlist_items": "1",
         "extract_flat": False,
-        "socket_timeout": 30,
-        "retries": 2,
+        "socket_timeout": 35,
+        "retries": 3,
         "nocheckcertificate": False,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+                "player_skip": ["js", "configs", "webpage"],
+            },
+            "twitter": {
+                "api": ["syndication"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(request.url, download=False)
+            info = ydl.extract_info(target_url, download=False)
     except yt_dlp.utils.UnsupportedError as exc:
         raise ExtractorFailure(
             "UNSUPPORTED_URL",
