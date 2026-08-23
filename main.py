@@ -82,12 +82,12 @@ class FormatInfo(BaseModel):
     resolution: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
-    fps: Optional[int] = None
+    fps: Optional[float] = None
     vcodec: Optional[str] = None
     acodec: Optional[str] = None
     abr: Optional[float] = None
     tbr: Optional[float] = None
-    filesize: Optional[int] = None
+    filesize: Optional[float] = None
     format_note: Optional[str] = None
     has_video: bool = False
     has_audio: bool = False
@@ -116,7 +116,7 @@ class MediaInfo(BaseModel):
     description: Optional[str] = None
     uploader: Optional[str] = None
     upload_date: Optional[str] = None
-    duration: Optional[int] = None
+    duration: Optional[float] = None
     duration_label: Optional[str] = None
     view_count: Optional[int] = None
     is_live: bool = False
