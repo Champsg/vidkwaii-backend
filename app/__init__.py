@@ -1,1 +1,1 @@
-"""Media Hub backend package."""
+"""VidKwaii backend package."""

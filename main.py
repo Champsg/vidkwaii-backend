@@ -1,4 +1,4 @@
-﻿"""Media Hub — FastAPI extractor backend.
+"""VidKwaii — FastAPI extractor backend.
 
 Exposes ``/api/v1/extract`` which resolves a URL with yt-dlp and normalizes
 the raw extractor output into a clean, client-friendly payload: formats,
@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -31,13 +32,13 @@ logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-logger = logging.getLogger("media_hub.api")
+logger = logging.getLogger("vidkwaii.api")
 
 app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
     description=(
-        "Universal media extraction & normalization service for the Media Hub "
+        "Universal media extraction & normalization service for the VidKwaii "
         "app. Resolves pages, direct files and HLS playlists into normalized "
         "formats."
     ),
@@ -104,6 +105,7 @@ class FormatInfo(BaseModel):
     has_audio: bool = False
     is_hls: bool = False
     quality_label: Optional[str] = None
+    http_headers: Optional[dict[str, str]] = None
 
 
 class SubtitleInfo(BaseModel):
@@ -140,6 +142,8 @@ class MediaInfo(BaseModel):
     suggested_filename: Optional[str] = None
     recommended_format_id: Optional[str] = None
     recommendation_reason: Optional[str] = None
+    best_audio_format_id: Optional[str] = None
+    http_headers: Optional[dict[str, str]] = None
     webpage_url: Optional[str] = None
     webpage_title: Optional[str] = None
     extractor: Optional[str] = None
@@ -229,6 +233,36 @@ def _validate_url(url: str) -> None:
                 code="INVALID_URL",
                 message="Only http(s) URLs are supported.",
                 suggestion="Paste a full link starting with http:// or https://.",
+            ).model_dump(),
+        )
+    try:
+        host = (urllib.parse.urlparse(url.strip()).hostname or "").lower()
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorDetail(
+                code="INVALID_URL",
+                message="The URL could not be parsed.",
+                suggestion=None,
+            ).model_dump(),
+        ) from None
+    instagram_hosts = (
+        "instagram.com",
+        "instagr.am",
+        "cdninstagram.com",
+    )
+    allowed = (
+        host in instagram_hosts
+        or host.endswith(".instagram.com")
+        or host.endswith(".instagr.am")
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=ErrorDetail(
+                code="INSTAGRAM_ONLY",
+                message="Only Instagram links are allowed.",
+                suggestion="Paste an Instagram post, reel or story URL.",
             ).model_dump(),
         )
 
@@ -468,6 +502,7 @@ def normalize(info: dict[str, Any], request: ExtractRequest) -> MediaInfo:
                 has_audio=has_audio,
                 is_hls=is_hls,
                 quality_label=_quality_label(fmt),
+                http_headers=fmt.get("http_headers"),
             )
         )
 
@@ -524,6 +559,10 @@ def normalize(info: dict[str, Any], request: ExtractRequest) -> MediaInfo:
     ext = recommended.ext if recommended else "mp4"
     suggested = f"{_slugify(info.get('title'))}.{ext}" if formats else f"{_slugify(info.get('title'))}.mp4"
 
+    audio_only = [f for f in formats if f.has_audio and not f.has_video]
+    best_audio = max(audio_only, key=lambda f: f.abr or 0) if audio_only else None
+    best_audio_id = best_audio.format_id if best_audio else None
+
     return MediaInfo(
         id=str(info.get("id") or ""),
         url=request.url,
@@ -544,6 +583,8 @@ def normalize(info: dict[str, Any], request: ExtractRequest) -> MediaInfo:
         suggested_filename=suggested,
         recommended_format_id=recommended_id,
         recommendation_reason=reason,
+        best_audio_format_id=best_audio_id,
+        http_headers=info.get("http_headers") or _BROWSER_HEADERS,
         webpage_url=info.get("webpage_url"),
         webpage_title=info.get("webpage_url") and info.get("title"),
         extractor=info.get("extractor_key") or info.get("extractor"),
@@ -584,29 +625,8 @@ def _run_ytdlp(request: ExtractRequest) -> dict[str, Any]:
     if "x.com" in target_url:
         target_url = target_url.replace("x.com", "twitter.com")
 
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "playlist_items": "1",
-        "extract_flat": False,
-        "socket_timeout": 30,
-        "retries": 3,
-        "nocheckcertificate": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
-                "player_skip": ["js", "configs", "webpage"],
-            },
-            "twitter": {
-                "api": ["syndication"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        }
-    }
+    opts = _build_ydl_opts()
+    opts["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
