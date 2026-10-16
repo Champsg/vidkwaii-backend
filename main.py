@@ -11,11 +11,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import shutil
 import time
 import urllib.parse
+import urllib.request
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,6 +37,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vidkwaii.api")
 
+
+async def _keep_alive_loop() -> None:
+    """Periodically ping the service (via RENDER_EXTERNAL_URL or localhost) to prevent Render from sleeping."""
+    if not settings.keep_alive_enabled:
+        logger.info("Keep-alive loop is disabled.")
+        return
+
+    interval = max(60, settings.keep_alive_interval_seconds)
+    logger.info("Starting keep-alive background task (interval=%ds)...", interval)
+
+    # Initial delay before the first ping
+    await asyncio.sleep(30)
+
+    ext_url = settings.render_external_url or os.getenv("RENDER_EXTERNAL_URL")
+    port = os.getenv("PORT", "8000")
+
+    targets: list[str] = []
+    if ext_url:
+        targets.append(ext_url.rstrip("/") + "/health")
+    targets.append(f"http://127.0.0.1:{port}/health")
+
+    while True:
+        try:
+            for target in targets:
+                try:
+                    def _do_ping(url: str) -> int:
+                        req = urllib.request.Request(
+                            url,
+                            headers={"User-Agent": "MediaHub-KeepAlive/1.0"},
+                        )
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            return resp.status
+
+                    status = await asyncio.to_thread(_do_ping, target)
+                    logger.info("Keep-alive ping to %s returned %d", target, status)
+                    break
+                except Exception as exc:
+                    logger.debug("Keep-alive ping to %s failed: %s", target, exc)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Error in keep-alive loop: %s", exc)
+
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    keep_alive_task = asyncio.create_task(_keep_alive_loop())
+    try:
+        yield
+    finally:
+        keep_alive_task.cancel()
+        try:
+            await keep_alive_task
+        except asyncio.CancelledError:
+            pass
+
+
 app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
@@ -42,7 +104,9 @@ app = FastAPI(
         "app. Resolves pages, direct files and HLS playlists into normalized "
         "formats."
     ),
+    lifespan=lifespan,
 )
+
 
 app.add_middleware(
     CORSMiddleware,

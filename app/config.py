@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     media_ttl_seconds: int = 1800
     cors_origins: list[str] = ["*"]
     log_level: str = "INFO"
+    keep_alive_enabled: bool = True
+    keep_alive_interval_seconds: int = 600
+    render_external_url: str | None = None
+
 
 
 @lru_cache
@@ -32,3 +36,4 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
